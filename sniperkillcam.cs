@@ -58,6 +58,14 @@ namespace sniperkillcam
         // "내가 마지막으로 쏜 시간" (unscaled time)
         private float _lastShotTimeUnscaled = -999f;
 
+        // 내가 마지막으로 쏜 위치/방향 (카메라 기준)
+        private Vector3 _lastShotOrigin = Vector3.zero;
+        private Vector3 _lastShotForward = Vector3.forward;
+
+        // 방향 필터 설정
+        private const float MAX_SHOT_ANGLE = 15f;      // 샷 방향과 적 방향의 최대 각도 차 (deg)
+        private const float MAX_SHOT_SIDE_DISTANCE = 4f; // 샷 경로에서의 최대 수직 거리
+
         // ─────────────── KillCam 상태 ───────────────
         private bool _isPlaying;
         private float _startTimeUnscaled;
@@ -93,6 +101,18 @@ namespace sniperkillcam
             if (Input.GetMouseButtonDown(0))
             {
                 _lastShotTimeUnscaled = Time.unscaledTime;
+
+                if (_mainCamera != null)
+                {
+                    _lastShotOrigin = _mainCamera.transform.position;
+                    _lastShotForward = _mainCamera.transform.forward.normalized;
+                }
+                else
+                {
+                    _lastShotOrigin = Vector3.zero;
+                    _lastShotForward = Vector3.forward;
+                }
+
                 // Debug.Log("[SniperKillCam] Shot detected at " + _lastShotTimeUnscaled.ToString("F3"));
             }
 
@@ -334,6 +354,48 @@ namespace sniperkillcam
             if (dist < SNIPER_MIN_DISTANCE)
                 return;
 
+            // ── 방향 필터: 내가 쏜 방향과 적 위치가 어느 정도 일치하는지 체크 ──
+
+            // 1) 적이 "발사 방향 앞쪽"에 있는지 (뒤쪽이면 스킵)
+            Vector3 shotToEnemy = enemyPos - _lastShotOrigin;
+            if (shotToEnemy.sqrMagnitude < 0.0001f)
+            {
+                // 발사 위치와 거의 같은 위치면 그냥 스킵
+                Debug.Log("[SniperKillCam] KillCam 스킵: enemy too close to shot origin");
+                return;
+            }
+
+            Vector3 dirToEnemy = shotToEnemy.normalized;
+            float dot = Vector3.Dot(_lastShotForward, dirToEnemy);
+            if (dot <= 0f)
+            {
+                // 내 샷 방향의 정반대 혹은 옆쪽 → 내가 쏜 방향이 아님
+                Debug.Log("[SniperKillCam] KillCam 스킵: enemy behind shot direction: " + enemyName);
+                return;
+            }
+
+            // 2) 각도 제한
+            float angle = Vector3.Angle(_lastShotForward, dirToEnemy);
+            if (angle > MAX_SHOT_ANGLE)
+            {
+                Debug.Log("[SniperKillCam] KillCam 스킵: angle too large " +
+                          angle.ToString("F1") + " deg, target=" + enemyName);
+                return;
+            }
+
+            // 3) 샷 경로에서의 수직 거리 제한 (탄 경로에서 너무 벗어나면 스킵)
+            float along = Vector3.Dot(shotToEnemy, _lastShotForward); // 경로 상 거리
+            Vector3 closestPoint = _lastShotOrigin + _lastShotForward * along;
+            float sideDist = (enemyPos - closestPoint).magnitude;
+            if (sideDist > MAX_SHOT_SIDE_DISTANCE)
+            {
+                Debug.Log("[SniperKillCam] KillCam 스킵: side distance too large " +
+                          sideDist.ToString("F2") + " target=" + enemyName);
+                return;
+            }
+
+            // ── 여기까지 통과하면 "내가 방금 쏜 탄에 맞아 죽었을 확률이 높다"라고 보고 킬캠 ──
+
             // 머리 위치 대충 위로 올려서 사용
             Vector3 headPos = enemyPos + Vector3.up * 1.6f;
 
@@ -355,7 +417,9 @@ namespace sniperkillcam
             StartKillCam(startPos, endPos, null);
 
             Debug.Log("[SniperKillCam] KillCam start: target=" + enemyName +
-                      " dist=" + dist.ToString("F1"));
+                      " dist=" + dist.ToString("F1") +
+                      " angle=" + angle.ToString("F1") +
+                      " sideDist=" + sideDist.ToString("F2"));
         }
 
         private void StartKillCam(Vector3 startPos, Vector3 endPos, Transform lookTarget)
