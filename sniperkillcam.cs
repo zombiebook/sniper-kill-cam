@@ -1,6 +1,18 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using ItemStatsSystem;
 using UnityEngine;
+
+// ─────────────────────────────────────────────────────────────
+// SniperKillCam.cs
+// - 모드로 체크 가능한 엔트리(sniperkillcam.ModBehaviour)
+// - 저격 대미지: 몸 0.99배 / 머리 3배
+// - 멀리 있는 적을 저격으로 죽이면 슬로우 + 총알 추적 킬캠
+// - 테스트 입력: 우클릭(조준) + Q 로 레이캐스트 발사
+// ─────────────────────────────────────────────────────────────
 
 namespace sniperkillcam
 {
@@ -14,466 +26,628 @@ namespace sniperkillcam
                 GameObject root = new GameObject("SniperKillCamRoot");
                 UnityEngine.Object.DontDestroyOnLoad(root);
 
+                // 매니저 및 테스트용 컴포넌트 추가
                 root.AddComponent<SniperKillCamManager>();
+                root.AddComponent<SniperKillCamTester>();
 
-                Debug.Log("[SniperKillCam] OnAfterSetup - Manager created");
+                Debug.Log("[sniperkillcam] Sniper Kill Cam + Damage mod loaded.");
             }
             catch (Exception ex)
             {
-                Debug.Log("[SniperKillCam] OnAfterSetup 예외: " + ex);
+                Debug.Log("[sniperkillcam] OnAfterSetup 예외: " + ex);
             }
         }
     }
 
+    /// <summary>
+    /// 실제 킬캠 카메라 연출 담당 매니저
+    /// </summary>
     public class SniperKillCamManager : MonoBehaviour
     {
-        // ─────────────── 내부용 적 트래킹 정보 ───────────────
-        private class TrackedEnemy
+        private static SniperKillCamManager _instance;
+        public static SniperKillCamManager Instance
         {
-            public Transform transform;
-            public Vector3 lastKnownPosition;
-            public string lastName;
-            public bool wasPresent;
-            public bool stillExists;
+            get
+            {
+                if (_instance == null)
+                {
+                    _instance = UnityEngine.Object.FindObjectOfType<SniperKillCamManager>();
+                    if (_instance == null)
+                    {
+                        GameObject go = new GameObject("SniperKillCamManager_Auto");
+                        UnityEngine.Object.DontDestroyOnLoad(go);
+                        _instance = go.AddComponent<SniperKillCamManager>();
+                    }
+                }
+                return _instance;
+            }
         }
 
-        // ─────────────── 기본 상태 ───────────────
         private Camera _mainCamera;
-        private Transform _playerTransform;
 
-        private readonly List<TrackedEnemy> _trackedEnemies = new List<TrackedEnemy>();
+        private bool _isKillCamPlaying;
+        private float _killCamTimer;
+        private float _killCamDuration = 1.5f; // 실시간 기준 1.5초
 
-        private float _scanInterval = 0.25f;   // 몇 초마다 캐릭터 스캔할지
-        private float _scanTimer;
+        private Vector3 _camStartPos;
+        private Quaternion _camStartRot;
 
-        // 멀리 있는 적만 킬캠 (스나이퍼 느낌용)
-        private const float SNIPER_MIN_DISTANCE = 25f;
+        private Vector3 _killStartPos;
+        private Vector3 _killTargetPos;
 
-        // 킬캠 연출 시간(실제 시간 기준, unscaledTime 기준)
-        private const float KILLCAM_DURATION = 1.2f;
-
-        // 슬로우 타임 값
-        private const float SLOW_TIMESCALE = 0.1f;
-
-        // "내가 마지막으로 쏜 시간" (unscaled time)
-        private float _lastShotTimeUnscaled = -999f;
-
-        // 내가 마지막으로 쏜 위치/방향 (카메라 기준)
-        private Vector3 _lastShotOrigin = Vector3.zero;
-        private Vector3 _lastShotForward = Vector3.forward;
-
-        // 방향 필터 설정
-        private const float MAX_SHOT_ANGLE = 15f;      // 샷 방향과 적 방향의 최대 각도 차 (deg)
-        private const float MAX_SHOT_SIDE_DISTANCE = 4f; // 샷 경로에서의 최대 수직 거리
-
-        // ─────────────── KillCam 상태 ───────────────
-        private bool _isPlaying;
-        private float _startTimeUnscaled;
-        private Vector3 _startPos;
-        private Vector3 _endPos;
-        private Transform _lookTarget;
-        private float _savedTimeScale = 1f;
-
-        // ─────────────── Unity LifeCycle ───────────────
+        private float _originalTimeScale = 1f;
 
         private void Awake()
         {
-            DontDestroyOnLoad(gameObject);
-            Debug.Log("[SniperKillCam] Manager Awake");
+            if (_instance == null)
+            {
+                _instance = this;
+            }
+            else if (_instance != this)
+            {
+                Destroy(this.gameObject);
+                return;
+            }
+
+            UnityEngine.Object.DontDestroyOnLoad(this.gameObject);
         }
 
         private void Update()
         {
-            // 메인 카메라 확보
-            if (_mainCamera == null || !_mainCamera.gameObject.activeInHierarchy)
+            if (_isKillCamPlaying)
+            {
+                UpdateKillCam();
+            }
+        }
+
+        public static void PlayKillCamStatic(Camera cam, Vector3 origin, Vector3 hitPoint)
+        {
+            if (cam == null) return;
+            Instance.PlayKillCam(cam, origin, hitPoint);
+        }
+
+        public void PlayKillCam(Camera cam, Vector3 origin, Vector3 hitPoint)
+        {
+            if (cam == null) return;
+
+            _mainCamera = cam;
+
+            // 이미 킬캠 중이면 즉시 복원 후 새로 시작
+            if (_isKillCamPlaying)
+            {
+                RestoreCamera();
+            }
+
+            _camStartPos = _mainCamera.transform.position;
+            _camStartRot = _mainCamera.transform.rotation;
+
+            _killStartPos = origin;
+            _killTargetPos = hitPoint;
+
+            _killCamTimer = 0f;
+            _originalTimeScale = Time.timeScale;
+            Time.timeScale = 0.2f; // 슬로우 모션
+
+            _isKillCamPlaying = true;
+
+            Debug.Log("[sniperkillcam] KillCam 시작 origin=" + origin + " target=" + hitPoint);
+        }
+
+        private void UpdateKillCam()
+        {
+            if (_mainCamera == null)
             {
                 _mainCamera = Camera.main;
+                if (_mainCamera == null)
+                {
+                    StopKillCam();
+                    return;
+                }
             }
 
-            // 킬캠 켜져 있으면 슬로우 강제 유지
-            if (_isPlaying)
+            float dt = Time.unscaledDeltaTime; // 슬로우모션에서도 일정한 속도
+            _killCamTimer += dt;
+
+            float t = 0f;
+            if (_killCamDuration > 0.0001f)
+                t = Mathf.Clamp01(_killCamTimer / _killCamDuration);
+
+            Vector3 dir = (_killTargetPos - _killStartPos);
+            if (dir.sqrMagnitude < 0.0001f)
             {
-                ApplySlowMotion();
-                return;
+                dir = _mainCamera.transform.forward;
             }
+            Vector3 dirNorm = dir.normalized;
 
-            // 플레이어 발사 입력 감지 (좌클릭)
-            if (Input.GetMouseButtonDown(0))
+            // 카메라를 총알보다 약간 뒤에서 따라가는 느낌
+            Vector3 camPos = Vector3.Lerp(
+                _killStartPos - dirNorm * 2f + Vector3.up * 0.3f,
+                _killTargetPos - dirNorm * 0.5f + Vector3.up * 0.3f,
+                t
+            );
+
+            _mainCamera.transform.position = camPos;
+            _mainCamera.transform.rotation = Quaternion.LookRotation(dirNorm, Vector3.up);
+
+            if (t >= 1f)
             {
-                _lastShotTimeUnscaled = Time.unscaledTime;
+                StopKillCam();
+            }
+        }
 
+        private void StopKillCam()
+        {
+            RestoreCamera();
+            _isKillCamPlaying = false;
+            Debug.Log("[sniperkillcam] KillCam 종료");
+        }
+
+        private void RestoreCamera()
+        {
+            try
+            {
                 if (_mainCamera != null)
                 {
-                    _lastShotOrigin = _mainCamera.transform.position;
-                    _lastShotForward = _mainCamera.transform.forward.normalized;
+                    _mainCamera.transform.position = _camStartPos;
+                    _mainCamera.transform.rotation = _camStartRot;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[sniperkillcam] RestoreCamera 예외: " + ex);
+            }
+
+            Time.timeScale = _originalTimeScale;
+        }
+    }
+
+    /// <summary>
+    /// 테스트 및 입력 처리:
+    /// - 우클릭(조준) + Q 를 누르면
+    ///   카메라 중앙에서 Ray 쏴서 저격 대미지 + 킬캠 실행
+    /// </summary>
+    public class SniperKillCamTester : MonoBehaviour
+    {
+        private Camera _mainCamera;
+        private int _layerMask;
+
+        private void Start()
+        {
+            _mainCamera = Camera.main;
+            _layerMask = ~0; // 모든 레이어
+        }
+
+        private void Update()
+        {
+            if (_mainCamera == null)
+            {
+                _mainCamera = Camera.main;
+                if (_mainCamera == null) return;
+            }
+
+            // 예시: 우클릭(조준) 중일 때만 작동
+            bool isAiming = Input.GetMouseButton(1);
+            if (!isAiming) return;
+
+            // Q 를 누르는 순간 한 번 발사
+            if (Input.GetKeyDown(KeyCode.Q))
+            {
+                TryFireSniperRay();
+            }
+        }
+
+        private void TryFireSniperRay()
+        {
+            try
+            {
+                Ray ray = _mainCamera.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0f));
+                RaycastHit hit;
+
+                if (Physics.Raycast(ray, out hit, 1000f, _layerMask))
+                {
+                    float baseDamage = 50f; // 임시 기본 대미지 (나중에 총기에서 가져와도 됨)
+
+                    Debug.Log("[sniperkillcam] Ray hit " + hit.collider.name + " baseDamage=" + baseDamage);
+
+                    SniperKillCamLogic.ApplySniperShot(_mainCamera, hit.collider, hit.point, baseDamage);
                 }
                 else
                 {
-                    _lastShotOrigin = Vector3.zero;
-                    _lastShotForward = Vector3.forward;
+                    Debug.Log("[sniperkillcam] Ray hit 없음");
                 }
-
-                // Debug.Log("[SniperKillCam] Shot detected at " + _lastShotTimeUnscaled.ToString("F3"));
             }
-
-            _scanTimer -= Time.unscaledDeltaTime;
-            if (_scanTimer <= 0f)
+            catch (Exception ex)
             {
-                _scanTimer = _scanInterval;
-                RefreshCharacters();
-                CheckEnemyDisappear();
+                Debug.Log("[sniperkillcam] TryFireSniperRay 예외: " + ex);
             }
         }
+    }
 
-        private void LateUpdate()
+    // ─────────────────────────────────────────────────────
+    // 저격 대미지 + 킬캠 트리거 로직
+    // - Health 타입 이름 직접 사용 X
+    // - "health" 가 들어간 컴포넌트를 자동으로 찾아서
+    //   현재/최대 체력 멤버를 리플렉션으로 사용
+    // - 몸샷: baseDamage * 0.99
+    // - 헤드샷: baseDamage * 3.0
+    // - 죽였고 거리가 멀면 KillCam 실행
+    // ─────────────────────────────────────────────────────
+    public static class SniperKillCamLogic
+    {
+        private static Type _cachedHealthType;
+        private static PropertyInfo _propCurrentHealth;
+        private static PropertyInfo _propMaxHealth;
+        private static FieldInfo _fieldCurrentHealth;
+        private static FieldInfo _fieldMaxHealth;
+
+        public static void ApplySniperShot(Camera cam, Collider hitCol, Vector3 hitPoint, float baseDamage)
         {
-            if (!_isPlaying || _mainCamera == null)
-                return;
+            if (hitCol == null) return;
+            if (baseDamage <= 0f) return;
 
-            // 혹시라도 다른 쪽에서 timeScale을 되돌리면 다시 슬로우 적용
-            ApplySlowMotion();
-
-            float t = (Time.unscaledTime - _startTimeUnscaled) / KILLCAM_DURATION;
-            if (t >= 1f)
+            try
             {
-                EndKillCam();
-                return;
-            }
-
-            // 부드러운 가속/감속
-            t = Mathf.SmoothStep(0f, 1f, t);
-
-            Vector3 camPos = Vector3.Lerp(_startPos, _endPos, t);
-
-            Vector3 targetPos = _lookTarget != null ? _lookTarget.position : _endPos;
-
-            // 카메라가 벽 속으로 들어가지 않게 간단 충돌 보정
-            Vector3 dirFromTarget = camPos - targetPos;
-            float dist = dirFromTarget.magnitude;
-            if (dist > 0.01f)
-            {
-                RaycastHit hit;
-                if (Physics.Raycast(
-                        targetPos,
-                        dirFromTarget.normalized,
-                        out hit,
-                        dist,
-                        ~0,
-                        QueryTriggerInteraction.Ignore))
+                Component[] comps = hitCol.GetComponentsInParent<Component>();
+                if (comps == null || comps.Length == 0)
                 {
-                    camPos = hit.point;
+                    Debug.Log("[sniperkillcam] 상위 컴포넌트 없음");
+                    return;
                 }
-            }
 
-            _mainCamera.transform.position = camPos;
-            _mainCamera.transform.LookAt(targetPos);
-        }
+                object healthInstance = null;
+                Type healthType = null;
 
-        private void OnDestroy()
-        {
-            if (_isPlaying)
-            {
-                RestoreTimeScale();
-            }
-        }
-
-        // ─────────────── 캐릭터 스캔 ───────────────
-
-        private void RefreshCharacters()
-        {
-            if (_mainCamera == null)
-                return;
-
-            // 씬에 있는 모든 MonoBehaviour 검색
-            MonoBehaviour[] allMono = GameObject.FindObjectsOfType<MonoBehaviour>();
-            if (allMono == null || allMono.Length == 0)
-                return;
-
-            // 기존 적들은 일단 "안 보인다"로 마킹
-            for (int i = 0; i < _trackedEnemies.Count; i++)
-            {
-                if (_trackedEnemies[i] != null)
+                for (int i = 0; i < comps.Length; i++)
                 {
-                    _trackedEnemies[i].stillExists = false;
-                }
-            }
+                    Component c = comps[i];
+                    if (c == null) continue;
 
-            // 타입 이름에 "CharacterMainControl" 이 들어가는 컴포넌트만 골라서 캐릭터로 취급
-            List<Transform> charTransforms = new List<Transform>();
+                    Type t = c.GetType();
+                    string typeName = t.Name;
+                    if (string.IsNullOrEmpty(typeName)) continue;
 
-            for (int i = 0; i < allMono.Length; i++)
-            {
-                MonoBehaviour mb = allMono[i];
-                if (mb == null) continue;
-
-                Type t = mb.GetType();
-                if (t == null) continue;
-
-                string typeName = t.Name;
-                if (string.IsNullOrEmpty(typeName)) continue;
-
-                if (typeName.Contains("CharacterMainControl"))
-                {
-                    Transform tr = mb.transform;
-                    if (tr != null && !charTransforms.Contains(tr))
+                    string lower = typeName.ToLowerInvariant();
+                    if (lower.Contains("health"))
                     {
-                        charTransforms.Add(tr);
-                    }
-                }
-            }
-
-            if (charTransforms.Count == 0)
-                return;
-
-            // 플레이어 추정: 카메라에 가장 가까운 CharacterMainControl 하나
-            if (_playerTransform == null)
-            {
-                float bestDist = float.MaxValue;
-                Transform best = null;
-                Vector3 camPos = _mainCamera.transform.position;
-
-                for (int i = 0; i < charTransforms.Count; i++)
-                {
-                    Transform tr = charTransforms[i];
-                    float d = Vector3.Distance(tr.position, camPos);
-                    if (d < bestDist)
-                    {
-                        bestDist = d;
-                        best = tr;
-                    }
-                }
-
-                _playerTransform = best;
-                if (_playerTransform != null)
-                {
-                    Debug.Log("[SniperKillCam] Player 후보 감지: " + _playerTransform.name);
-                }
-            }
-
-            // 적 목록 갱신
-            for (int i = 0; i < charTransforms.Count; i++)
-            {
-                Transform tr = charTransforms[i];
-                if (tr == null)
-                    continue;
-
-                // 플레이어는 적 리스트에서 제외
-                if (_playerTransform != null && tr == _playerTransform)
-                    continue;
-
-                TrackedEnemy te = null;
-
-                for (int j = 0; j < _trackedEnemies.Count; j++)
-                {
-                    if (_trackedEnemies[j] != null && _trackedEnemies[j].transform == tr)
-                    {
-                        te = _trackedEnemies[j];
+                        healthInstance = c;
+                        healthType = t;
                         break;
                     }
                 }
 
-                if (te == null)
+                if (healthInstance == null || healthType == null)
                 {
-                    te = new TrackedEnemy();
-                    te.transform = tr;
-                    te.wasPresent = true;
-                    _trackedEnemies.Add(te);
-                    Debug.Log("[SniperKillCam] 적 등록: " + tr.name);
+                    Debug.Log("[sniperkillcam] Health 컴포넌트를 찾지 못했습니다.");
+                    return;
                 }
 
-                te.stillExists = true;
-                te.lastKnownPosition = tr.position;
-                te.lastName = tr.name;
+                InitHealthMembers(healthType);
+
+                if (_propCurrentHealth == null && _fieldCurrentHealth == null)
+                {
+                    Debug.Log("[sniperkillcam] 현재 체력 멤버를 찾지 못했습니다. type=" + healthType.FullName);
+                    return;
+                }
+
+                float curHp = GetMemberValue(healthInstance, _propCurrentHealth, _fieldCurrentHealth);
+                float maxHp = curHp;
+                if (_propMaxHealth != null || _fieldMaxHealth != null)
+                {
+                    maxHp = GetMemberValue(healthInstance, _propMaxHealth, _fieldMaxHealth);
+                }
+
+                bool isHead = IsHeadCollider(hitCol);
+
+                // ── 대미지 배율 ──
+                float multiplier = isHead ? 3.0f : 0.99f;
+                float finalDamage = baseDamage * multiplier;
+
+                float newHp = Mathf.Max(0f, curHp - finalDamage);
+
+                SetMemberValue(healthInstance, _propCurrentHealth, _fieldCurrentHealth, newHp);
+
+                Debug.Log(
+                    "[sniperkillcam] hit head=" + isHead +
+                    " base=" + baseDamage +
+                    " mul=" + multiplier +
+                    " final=" + finalDamage +
+                    " HP " + curHp + " -> " + newHp
+                );
+
+                bool killed = newHp <= 0f;
+
+                if (killed && cam != null)
+                {
+                    float dist = Vector3.Distance(cam.transform.position, hitPoint);
+
+                    // 어느 정도 이상 거리일 때만 킬캠 (예: 30m 이상)
+                    if (dist >= 30f)
+                    {
+                        SniperKillCamManager.PlayKillCamStatic(cam, cam.transform.position, hitPoint);
+                    }
+
+                    // 전리품/이펙트 보정용 Kill/Damage 메서드 호출 시도
+                    TryCallKillOrApplyDamage(healthInstance, finalDamage);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[sniperkillcam] ApplySniperShot 예외: " + ex);
             }
         }
 
-        // ─────────────── "사라진 적" = 사망으로 간주 ───────────────
-
-        private void CheckEnemyDisappear()
+        // ──────────────────────────────────────────────
+        // Health 멤버(현재/최대 체력) 리플렉션 초기화
+        // ──────────────────────────────────────────────
+        private static void InitHealthMembers(Type healthType)
         {
-            if (_playerTransform == null || _mainCamera == null)
-                return;
+            if (healthType == null) return;
 
-            for (int i = _trackedEnemies.Count - 1; i >= 0; i--)
+            if (_cachedHealthType == healthType &&
+                (_propCurrentHealth != null || _fieldCurrentHealth != null))
             {
-                TrackedEnemy te = _trackedEnemies[i];
-                if (te == null)
+                return;
+            }
+
+            _cachedHealthType = healthType;
+            _propCurrentHealth = null;
+            _propMaxHealth = null;
+            _fieldCurrentHealth = null;
+            _fieldMaxHealth = null;
+
+            BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            try
+            {
+                PropertyInfo[] props = healthType.GetProperties(flags);
+
+                _propCurrentHealth =
+                    FindNumberProperty(props, "current", "health") ??
+                    FindNumberProperty(props, "cur", "health") ??
+                    FindNumberProperty(props, null, "health");
+
+                _propMaxHealth =
+                    FindNumberProperty(props, "max", "health") ??
+                    FindNumberProperty(props, null, "max") ??
+                    FindNumberProperty(props, null, "health");
+
+                FieldInfo[] fields = healthType.GetFields(flags);
+
+                if (_propCurrentHealth == null)
                 {
-                    _trackedEnemies.RemoveAt(i);
-                    continue;
+                    _fieldCurrentHealth =
+                        FindNumberField(fields, "current", "health") ??
+                        FindNumberField(fields, "cur", "health") ??
+                        FindNumberField(fields, null, "health");
                 }
 
-                bool wasPresent = te.wasPresent;
-                bool nowExists = te.stillExists && te.transform != null;
-
-                // 이전 스캔에서 존재했는데 이번 스캔에는 없음 → "죽었을 가능성"
-                if (wasPresent && !nowExists)
+                if (_propMaxHealth == null)
                 {
-                    // ▶ 내가 최근에 쏜 직후에만 킬캠 시도 (0.8초 안)
-                    float dt = Time.unscaledTime - _lastShotTimeUnscaled;
-                    if (dt >= 0f && dt <= 0.8f)
-                    {
-                        TryStartKillCamForEnemy(te.lastKnownPosition, te.lastName);
-                    }
+                    _fieldMaxHealth =
+                        FindNumberField(fields, "max", "health") ??
+                        FindNumberField(fields, null, "max") ??
+                        FindNumberField(fields, null, "health");
+                }
+
+                Debug.Log(
+                    "[sniperkillcam] Health 멤버 탐색 완료: type=" + healthType.FullName +
+                    " curProp=" + NameOrNull(_propCurrentHealth) +
+                    " curField=" + NameOrNull(_fieldCurrentHealth) +
+                    " maxProp=" + NameOrNull(_propMaxHealth) +
+                    " maxField=" + NameOrNull(_fieldMaxHealth)
+                );
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[sniperkillcam] InitHealthMembers 예외: " + ex);
+            }
+        }
+
+        private static string NameOrNull(MemberInfo m)
+        {
+            return m == null ? "null" : m.Name;
+        }
+
+        private static PropertyInfo FindNumberProperty(PropertyInfo[] props, string key1, string key2)
+        {
+            if (props == null) return null;
+
+            string k1 = key1 != null ? key1.ToLowerInvariant() : null;
+            string k2 = key2 != null ? key2.ToLowerInvariant() : null;
+
+            for (int i = 0; i < props.Length; i++)
+            {
+                PropertyInfo p = props[i];
+                Type t = p.PropertyType;
+                if (t != typeof(float) && t != typeof(int)) continue;
+
+                string name = p.Name.ToLowerInvariant();
+
+                if (k1 != null && !name.Contains(k1)) continue;
+                if (k2 != null && !name.Contains(k2)) continue;
+
+                return p;
+            }
+
+            return null;
+        }
+
+        private static FieldInfo FindNumberField(FieldInfo[] fields, string key1, string key2)
+        {
+            if (fields == null) return null;
+
+            string k1 = key1 != null ? key1.ToLowerInvariant() : null;
+            string k2 = key2 != null ? key2.ToLowerInvariant() : null;
+
+            for (int i = 0; i < fields.Length; i++)
+            {
+                FieldInfo f = fields[i];
+                Type t = f.FieldType;
+                if (t != typeof(float) && t != typeof(int)) continue;
+
+                string name = f.Name.ToLowerInvariant();
+
+                if (k1 != null && !name.Contains(k1)) continue;
+                if (k2 != null && !name.Contains(k2)) continue;
+
+                return f;
+            }
+
+            return null;
+        }
+
+        private static float GetMemberValue(object instance, PropertyInfo prop, FieldInfo field)
+        {
+            try
+            {
+                if (prop != null)
+                {
+                    object v = prop.GetValue(instance, null);
+                    return Convert.ToSingle(v);
+                }
+
+                if (field != null)
+                {
+                    object v = field.GetValue(instance);
+                    return Convert.ToSingle(v);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[sniperkillcam] GetMemberValue 예외: " + ex);
+            }
+
+            return 0f;
+        }
+
+        private static void SetMemberValue(object instance, PropertyInfo prop, FieldInfo field, float value)
+        {
+            try
+            {
+                if (prop != null)
+                {
+                    if (prop.PropertyType == typeof(int))
+                        prop.SetValue(instance, (int)value, null);
                     else
+                        prop.SetValue(instance, value, null);
+                    return;
+                }
+
+                if (field != null)
+                {
+                    if (field.FieldType == typeof(int))
+                        field.SetValue(instance, (int)value);
+                    else
+                        field.SetValue(instance, value);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[sniperkillcam] SetMemberValue 예외: " + ex);
+            }
+        }
+
+        private static bool IsHeadCollider(Collider col)
+        {
+            if (col == null) return false;
+
+            try
+            {
+                string name = col.name;
+                if (!string.IsNullOrEmpty(name))
+                {
+                    string lower = name.ToLowerInvariant();
+                    if (lower.Contains("head") || lower.Contains("머리"))
+                        return true;
+                }
+
+                try
+                {
+                    if (col.CompareTag("head"))
+                        return true;
+                }
+                catch
+                {
+                    // 태그 없으면 무시
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.Log("[sniperkillcam] IsHeadCollider 예외: " + ex);
+            }
+
+            return false;
+        }
+
+        private static void TryCallKillOrApplyDamage(object healthInstance, float damage)
+        {
+            if (healthInstance == null) return;
+
+            try
+            {
+                Type t = healthInstance.GetType();
+                BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                MethodInfo[] methods = t.GetMethods(flags);
+
+                // 1) 매개변수 없는 Kill / Die 류
+                MethodInfo killMethod = null;
+
+                for (int i = 0; i < methods.Length; i++)
+                {
+                    MethodInfo m = methods[i];
+                    if (m.GetParameters().Length != 0) continue;
+
+                    string n = m.Name.ToLowerInvariant();
+                    if (n.Contains("kill") || n.Contains("die") || n.Contains("death"))
                     {
-                        Debug.Log("[SniperKillCam] 적 사라짐 감지 but 최근 샷 아님 -> 킬캠 스킵: "
-                                  + te.lastName + " dt=" + dt.ToString("F2"));
+                        killMethod = m;
+                        break;
                     }
-
-                    _trackedEnemies.RemoveAt(i);
-                    continue;
                 }
 
-                te.wasPresent = nowExists;
-
-                // 더 이상 존재하지 않으면 리스트에서 제거
-                if (!nowExists)
+                if (killMethod != null)
                 {
-                    _trackedEnemies.RemoveAt(i);
+                    killMethod.Invoke(healthInstance, null);
+                    Debug.Log("[sniperkillcam] Kill 메서드 호출: " + killMethod.Name);
+                    return;
                 }
-                else
+
+                // 2) float/int 하나 받는 Damage / Hit 류
+                MethodInfo dmgMethod = null;
+                ParameterInfo[] dmgParams = null;
+
+                for (int i = 0; i < methods.Length; i++)
                 {
-                    // 다음 스캔에서 다시 채울 거라 false로 리셋
-                    te.stillExists = false;
+                    MethodInfo m = methods[i];
+                    ParameterInfo[] ps = m.GetParameters();
+                    if (ps.Length != 1) continue;
+
+                    string n = m.Name.ToLowerInvariant();
+                    if (n.Contains("damage") || n.Contains("hit"))
+                    {
+                        dmgMethod = m;
+                        dmgParams = ps;
+                        break;
+                    }
                 }
+
+                if (dmgMethod != null && dmgParams != null)
+                {
+                    object arg = damage;
+                    if (dmgParams[0].ParameterType == typeof(int))
+                        arg = (int)damage;
+
+                    dmgMethod.Invoke(healthInstance, new object[] { arg });
+                    Debug.Log("[sniperkillcam] Damage 메서드 호출: " + dmgMethod.Name + " (" + arg + ")");
+                    return;
+                }
+
+                Debug.Log("[sniperkillcam] Kill/데미지 메서드 없음: type=" + t.FullName);
             }
-        }
-
-        // ─────────────── KillCam 시작 조건 / 연출 ───────────────
-
-        private void TryStartKillCamForEnemy(Vector3 enemyPos, string enemyName)
-        {
-            if (_isPlaying) return;
-            if (_playerTransform == null || _mainCamera == null) return;
-
-            Vector3 playerPos = _playerTransform.position;
-            float dist = Vector3.Distance(enemyPos, playerPos);
-
-            // 너무 가까운 적은 킬캠 스킵 (스나이퍼 느낌)
-            if (dist < SNIPER_MIN_DISTANCE)
-                return;
-
-            // ── 방향 필터: 내가 쏜 방향과 적 위치가 어느 정도 일치하는지 체크 ──
-
-            // 1) 적이 "발사 방향 앞쪽"에 있는지 (뒤쪽이면 스킵)
-            Vector3 shotToEnemy = enemyPos - _lastShotOrigin;
-            if (shotToEnemy.sqrMagnitude < 0.0001f)
+            catch (Exception ex)
             {
-                // 발사 위치와 거의 같은 위치면 그냥 스킵
-                Debug.Log("[SniperKillCam] KillCam 스킵: enemy too close to shot origin");
-                return;
+                Debug.Log("[sniperkillcam] TryCallKillOrApplyDamage 예외: " + ex);
             }
-
-            Vector3 dirToEnemy = shotToEnemy.normalized;
-            float dot = Vector3.Dot(_lastShotForward, dirToEnemy);
-            if (dot <= 0f)
-            {
-                // 내 샷 방향의 정반대 혹은 옆쪽 → 내가 쏜 방향이 아님
-                Debug.Log("[SniperKillCam] KillCam 스킵: enemy behind shot direction: " + enemyName);
-                return;
-            }
-
-            // 2) 각도 제한
-            float angle = Vector3.Angle(_lastShotForward, dirToEnemy);
-            if (angle > MAX_SHOT_ANGLE)
-            {
-                Debug.Log("[SniperKillCam] KillCam 스킵: angle too large " +
-                          angle.ToString("F1") + " deg, target=" + enemyName);
-                return;
-            }
-
-            // 3) 샷 경로에서의 수직 거리 제한 (탄 경로에서 너무 벗어나면 스킵)
-            float along = Vector3.Dot(shotToEnemy, _lastShotForward); // 경로 상 거리
-            Vector3 closestPoint = _lastShotOrigin + _lastShotForward * along;
-            float sideDist = (enemyPos - closestPoint).magnitude;
-            if (sideDist > MAX_SHOT_SIDE_DISTANCE)
-            {
-                Debug.Log("[SniperKillCam] KillCam 스킵: side distance too large " +
-                          sideDist.ToString("F2") + " target=" + enemyName);
-                return;
-            }
-
-            // ── 여기까지 통과하면 "내가 방금 쏜 탄에 맞아 죽었을 확률이 높다"라고 보고 킬캠 ──
-
-            // 머리 위치 대충 위로 올려서 사용
-            Vector3 headPos = enemyPos + Vector3.up * 1.6f;
-
-            Vector3 camPos = _mainCamera.transform.position;
-            Vector3 camForward = _mainCamera.transform.forward;
-
-            // 카메라 앞에서 약간 튀어나온 위치를 총알 출발점처럼 사용
-            Vector3 startPos = camPos + camForward * 0.3f + Vector3.up * -0.05f;
-
-            Vector3 dirToHead = headPos - startPos;
-            if (dirToHead.sqrMagnitude < 0.0001f)
-            {
-                dirToHead = camForward;
-            }
-
-            // 머리 바로 앞까지 날아가게
-            Vector3 endPos = headPos - dirToHead.normalized * 0.2f;
-
-            StartKillCam(startPos, endPos, null);
-
-            Debug.Log("[SniperKillCam] KillCam start: target=" + enemyName +
-                      " dist=" + dist.ToString("F1") +
-                      " angle=" + angle.ToString("F1") +
-                      " sideDist=" + sideDist.ToString("F2"));
-        }
-
-        private void StartKillCam(Vector3 startPos, Vector3 endPos, Transform lookTarget)
-        {
-            if (_mainCamera == null)
-                return;
-
-            if (_isPlaying)
-                return;
-
-            _isPlaying = true;
-            _startTimeUnscaled = Time.unscaledTime;
-
-            _startPos = startPos;
-            _endPos = endPos;
-            _lookTarget = lookTarget;
-
-            _savedTimeScale = Time.timeScale;
-            if (_savedTimeScale <= 0f)
-            {
-                _savedTimeScale = 1f;
-            }
-
-            ApplySlowMotion();
-
-            Debug.Log("[SniperKillCam] SlowMotion ON, saved=" + _savedTimeScale.ToString("F2")
-                      + " current=" + Time.timeScale.ToString("F2"));
-        }
-
-        private void EndKillCam()
-        {
-            _isPlaying = false;
-            _lookTarget = null;
-
-            RestoreTimeScale();
-
-            Debug.Log("[SniperKillCam] KillCam end, Time.timeScale=" + Time.timeScale.ToString("F2"));
-        }
-
-        // ─────────────── 타임스케일 유틸 ───────────────
-
-        private void ApplySlowMotion()
-        {
-            if (Mathf.Abs(Time.timeScale - SLOW_TIMESCALE) > 0.0001f)
-            {
-                Time.timeScale = SLOW_TIMESCALE;
-            }
-        }
-
-        private void RestoreTimeScale()
-        {
-            float target = _savedTimeScale;
-            if (target <= 0f) target = 1f;
-            Time.timeScale = target;
         }
     }
 }
